@@ -1,0 +1,20 @@
+# Dependências e builds
+node_modules/
+dist/
+
+# Ambiente local
+.env
+.env.*
+!.env.example
+
+# Artefatos temporários de importação
+repository.zip
+imported/
+.netlify-cli/
+.netlify/
+.deploy/
+
+# Sistema/editor
+.DS_Store
+Thumbs.db
+.vscode/
