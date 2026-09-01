@@ -21,7 +21,7 @@ async function isAdmin(req: Request, url: string, key: string) {
 
 async function publicData(url: URL, base: string, key: string) {
   const [servicesRes, barbersRes] = await Promise.all([
-    fetch(`${base}/rest/v1/barbershop_services?active=eq.true&select=id,name,description,duration_minutes,price&order=name`, { headers: headers(key) }),
+    fetch(`${base}/rest/v1/barbershop_services?active=eq.true&select=id,name,description,duration_minutes,price,image_url&order=name`, { headers: headers(key) }),
     fetch(`${base}/rest/v1/barbershop_barbers?active=eq.true&select=id,name,role,photo_url,email&order=name`, { headers: headers(key) }),
   ]);
   const services = await servicesRes.json(), barbers = await barbersRes.json();
@@ -49,6 +49,9 @@ async function email(key: string | undefined, body: Record<string,unknown>) {
   if (!key) return;
   const response = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!response.ok) console.error('email failed', response.status);
+}
+async function audit(base:string,key:string,user:{id?:string,email?:string}|null,action:string,details:Record<string,unknown>={}) {
+  await fetch(`${base}/rest/v1/barbershop_audit_logs`,{method:'POST',headers:headers(key),body:JSON.stringify({user_id:user?.id||null,user_email:user?.email||null,action,details})});
 }
 
 Deno.serve(async req => {
@@ -88,33 +91,37 @@ Deno.serve(async req => {
     const admin = await isAdmin(req,base,key);
     if (!admin) return json({ error:'Acesso administrativo não autorizado.' },401);
     if (req.method === 'GET') {
-      const [services,barbers,bookings,availability] = await Promise.all([
+      const [services,barbers,bookings,availability,logs] = await Promise.all([
         fetch(`${base}/rest/v1/barbershop_services?select=*&order=name`,{headers:headers(key)}), fetch(`${base}/rest/v1/barbershop_barbers?select=*&order=name`,{headers:headers(key)}),
-        fetch(`${base}/rest/v1/barbershop_bookings?select=*&order=appointment_date,appointment_time`,{headers:headers(key)}), fetch(`${base}/rest/v1/barbershop_availability?select=*&order=appointment_date`,{headers:headers(key)}),
+        fetch(`${base}/rest/v1/barbershop_bookings?select=*&order=appointment_date,appointment_time`,{headers:headers(key)}), fetch(`${base}/rest/v1/barbershop_availability?select=*&order=appointment_date`,{headers:headers(key)}), fetch(`${base}/rest/v1/barbershop_audit_logs?select=*&order=created_at.desc&limit=200`,{headers:headers(key)}),
       ]);
-      return json({services:await services.json(),barbers:await barbers.json(),bookings:await bookings.json(),availability:await availability.json(),user:{email:admin.email}});
+      return json({services:await services.json(),barbers:await barbers.json(),bookings:await bookings.json(),availability:await availability.json(),logs:logs.ok?await logs.json():[],user:{email:admin.email}});
     }
     if (req.method !== 'PATCH') return json({error:'Método não permitido.'},405);
     const body=await req.json();
     if (body.action === 'service') {
-      const s=body.service||{}, id=clean(s.id,50), payload={name:clean(s.name,100),description:clean(s.description,400),duration_minutes:Number(s.duration_minutes),price:Number(s.price),active:Boolean(s.active)};
+      const s=body.service||{}, id=clean(s.id,50), payload={name:clean(s.name,100),description:clean(s.description,400),duration_minutes:Number(s.duration_minutes),price:Number(s.price),active:Boolean(s.active),image_url:clean(s.image_url,1000)||null};
       if(!id||!payload.name||!Number.isFinite(payload.duration_minutes)||!Number.isFinite(payload.price)) return json({error:'Dados do serviço inválidos.'},400);
-      await fetch(`${base}/rest/v1/barbershop_services?id=eq.${encodeURIComponent(id)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify(payload)}); return json({ok:true});
+      await fetch(`${base}/rest/v1/barbershop_services?id=eq.${encodeURIComponent(id)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify(payload)}); await audit(base,key,admin,'service.updated',{id,name:payload.name}); return json({ok:true});
     }
     if (body.action === 'barber') {
       const b=body.barber||{}, id=clean(b.id,50), payload={name:clean(b.name,100),role:clean(b.role,100),email:clean(b.email,180)||null,photo_url:clean(b.photo_url,1000)||null,active:Boolean(b.active)};
       if(!id||!payload.name) return json({error:'Dados do barbeiro inválidos.'},400);
-      await fetch(`${base}/rest/v1/barbershop_barbers?id=eq.${encodeURIComponent(id)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify(payload)}); return json({ok:true});
+      await fetch(`${base}/rest/v1/barbershop_barbers?id=eq.${encodeURIComponent(id)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify(payload)}); await audit(base,key,admin,'barber.updated',{id,name:payload.name}); return json({ok:true});
     }
     if (body.action === 'availability') {
       const a=body.availability||{}, barberId=clean(a.barber_id,50), date=clean(a.appointment_date,10), availableTimes=Array.isArray(a.available_times)?a.available_times.map((x:unknown)=>clean(x,5)).filter((x:string)=>/^([01]\d|2[0-3]):[0-5]\d$/.test(x)):[];
       if(!barberId||!/^\d{4}-\d{2}-\d{2}$/.test(date)) return json({error:'Data ou profissional inválido.'},400);
       const save=await fetch(`${base}/rest/v1/barbershop_availability?on_conflict=barber_id,appointment_date`,{method:'POST',headers:headers(key,{Prefer:'resolution=merge-duplicates'}),body:JSON.stringify({barber_id:barberId,appointment_date:date,available_times:availableTimes})});
-      return save.ok?json({ok:true}):json({error:'Não foi possível salvar os horários.'},500);
+      if(save.ok){await audit(base,key,admin,'availability.updated',{barber_id:barberId,appointment_date:date,available_times:availableTimes});return json({ok:true});} return json({error:'Não foi possível salvar os horários.'},500);
     }
     if (body.action === 'booking-status') {
       const id=clean(body.id,80), status=clean(body.status,20); if(!id||!['pending','confirmed','completed','cancelled','no_show'].includes(status)) return json({error:'Status inválido.'},400);
-      await fetch(`${base}/rest/v1/barbershop_bookings?id=eq.${encodeURIComponent(id)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify({status})}); return json({ok:true});
+      const currentRes=await fetch(`${base}/rest/v1/barbershop_bookings?id=eq.${encodeURIComponent(id)}&select=*`,{headers:headers(key)}), current=(await currentRes.json())[0];
+      await fetch(`${base}/rest/v1/barbershop_bookings?id=eq.${encodeURIComponent(id)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify({status})});
+      await audit(base,key,admin,'booking.status_changed',{id,status});
+      if(status==='cancelled'&&current?.client_email){const dateText=new Date(`${current.appointment_date}T12:00:00`).toLocaleDateString('pt-BR');await email(Deno.env.get('RESEND_API_KEY'),{from:Deno.env.get('BOOKING_EMAIL_FROM')||'Alisson Brown <onboarding@resend.dev>',to:[current.client_email],subject:`Agendamento cancelado — ${current.protocol}`,html:`<p>Olá, ${escapeHtml(current.client_name)}.</p><p>Seu agendamento de ${dateText} às ${current.appointment_time} foi cancelado pela barbearia.</p><p>Entre em contato para escolher um novo horário.</p>`});}
+      return json({ok:true});
     }
     if (body.action === 'photo') {
       const barberId=clean(body.barber_id,50), content=clean(body.content,3000000), mime=clean(body.mime,30);
@@ -124,7 +131,22 @@ Deno.serve(async req => {
       const upload=await fetch(`${base}/storage/v1/object/barbershop-photos/${path}`,{method:'POST',headers:{apikey:key,Authorization:`Bearer ${key}`,'Content-Type':mime,'x-upsert':'true'},body:bytes});
       if(!upload.ok)return json({error:'Não foi possível enviar a imagem.'},500);
       const photo_url=`${base}/storage/v1/object/public/barbershop-photos/${path}`;
-      await fetch(`${base}/rest/v1/barbershop_barbers?id=eq.${encodeURIComponent(barberId)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify({photo_url})}); return json({ok:true,photo_url});
+      await fetch(`${base}/rest/v1/barbershop_barbers?id=eq.${encodeURIComponent(barberId)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify({photo_url})}); await audit(base,key,admin,'barber.photo_updated',{barber_id:barberId}); return json({ok:true,photo_url});
+    }
+    if (body.action === 'service-photo') {
+      const serviceId=clean(body.service_id,50), content=clean(body.content,3000000), mime=clean(body.mime,30);
+      if(!serviceId||!content||!['image/jpeg','image/png','image/webp'].includes(mime)) return json({error:'Imagem inválida.'},400);
+      const bytes=Uint8Array.from(atob(content),x=>x.charCodeAt(0)); if(bytes.byteLength>2000000)return json({error:'A imagem deve ter até 2 MB.'},400);
+      const ext=mime==='image/png'?'png':mime==='image/webp'?'webp':'jpg',path=`service-${serviceId}-${Date.now()}.${ext}`;
+      const upload=await fetch(`${base}/storage/v1/object/barbershop-photos/${path}`,{method:'POST',headers:{apikey:key,Authorization:`Bearer ${key}`,'Content-Type':mime,'x-upsert':'true'},body:bytes});
+      if(!upload.ok)return json({error:'Não foi possível enviar a imagem.'},500);
+      const image_url=`${base}/storage/v1/object/public/barbershop-photos/${path}`;
+      await fetch(`${base}/rest/v1/barbershop_services?id=eq.${encodeURIComponent(serviceId)}`,{method:'PATCH',headers:headers(key),body:JSON.stringify({image_url})}); await audit(base,key,admin,'service.photo_updated',{service_id:serviceId}); return json({ok:true,image_url});
+    }
+    if (body.action === 'create-admin') {
+      const email=clean(body.email,180).toLowerCase(), password=clean(body.password,120); if(!email||password.length<6)return json({error:'Informe e-mail e senha com pelo menos 6 caracteres.'},400);
+      const created=await fetch(`${base}/auth/v1/admin/users`,{method:'POST',headers:headers(key),body:JSON.stringify({email,password,email_confirm:true})}), user=await created.json(); if(!created.ok)return json({error:user?.msg||user?.message||'Não foi possível criar a conta.'},400);
+      await fetch(`${base}/rest/v1/barbershop_admins`,{method:'POST',headers:headers(key),body:JSON.stringify({user_id:user.id})}); await audit(base,key,admin,'admin.created',{email}); return json({ok:true});
     }
     return json({error:'Ação desconhecida.'},400);
   } catch (error) { console.error('booking-api error',error instanceof Error?error.message:'unknown'); return json({error:'Solicitação inválida.'},400); }
